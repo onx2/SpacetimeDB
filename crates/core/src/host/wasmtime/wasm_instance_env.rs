@@ -833,6 +833,51 @@ impl WasmInstanceEnv {
         )
     }
 
+    /// Finds all rows in the index identified by `index_id`
+    /// matching a *multi-range* ("skip scan") query, where each of the `num_cols` leading
+    /// indexed columns carries its own `Bound<AlgebraicValue>` start and end,
+    /// encoded in `bounds = bounds_ptr[..bounds_len]` (see `multi_bounds_from_bsatn`).
+    ///
+    /// The matching `RowIter` is written to `out`.
+    ///
+    /// This is an unstable ABI addition (`spacetime_10.6`); only modules built with the
+    /// `unstable` feature import it. Existing modules and other-language SDKs are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// - `NOT_IN_TRANSACTION`, when called outside of a transaction.
+    /// - `NO_SUCH_INDEX`, when `index_id` is not a known ID of an index.
+    /// - `WRONG_INDEX_ALGO` if the index is not a range-scan compatible index.
+    /// - `BSATN_DECODE_ERROR`, when `bounds` cannot be decoded to `num_cols` pairs of
+    ///   `Bound<AlgebraicValue>` typed at the index's leading `num_cols` column types.
+    pub fn datastore_index_scan_multi_range_bsatn(
+        caller: Caller<'_, Self>,
+        index_id: u32,
+        num_cols: u32,
+        bounds_ptr: WasmPtr<u8>,
+        bounds_len: u32,
+        out: WasmPtr<RowIterIdx>,
+    ) -> RtResult<u32> {
+        Self::cvt_ret(caller, AbiCall::DatastoreIndexScanMultiRangeBsatn, out, |caller| {
+            let num_cols = Self::convert_u32_to_col_id(num_cols)?;
+
+            let (mem, env) = Self::mem_env(caller);
+            // Read the per-column bounds from WASM memory.
+            let bounds = mem.deref_slice(bounds_ptr, bounds_len)?;
+
+            // Find the relevant rows.
+            let chunks = env.instance_env.datastore_index_scan_multi_range_bsatn_chunks(
+                &mut env.chunk_pool,
+                index_id.into(),
+                num_cols,
+                bounds,
+            )?;
+
+            // Insert the encoded + concatenated rows into a new buffer and return its id.
+            Ok(env.iters.insert(chunks.into_iter()))
+        })
+    }
+
     /// Reads rows from the given iterator registered under `iter`.
     ///
     /// Takes rows from the iterator
@@ -1166,6 +1211,40 @@ impl WasmInstanceEnv {
                 rend,
             )?)
         })
+    }
+
+    /// Deletes all rows found by a multi-range ("skip scan") query;
+    /// the delete counterpart of [`Self::datastore_index_scan_multi_range_bsatn`].
+    ///
+    /// The number of rows deleted is written to the WASM pointer `out`.
+    /// This is an unstable ABI addition (`spacetime_10.6`).
+    pub fn datastore_delete_by_index_scan_multi_range_bsatn(
+        caller: Caller<'_, Self>,
+        index_id: u32,
+        num_cols: u32,
+        bounds_ptr: WasmPtr<u8>,
+        bounds_len: u32,
+        out: WasmPtr<u32>,
+    ) -> RtResult<u32> {
+        Self::cvt_ret(
+            caller,
+            AbiCall::DatastoreDeleteByIndexScanMultiRangeBsatn,
+            out,
+            |caller| {
+                let num_cols = Self::convert_u32_to_col_id(num_cols)?;
+
+                let (mem, env) = Self::mem_env(caller);
+                // Read the per-column bounds from WASM memory.
+                let bounds = mem.deref_slice(bounds_ptr, bounds_len)?;
+
+                // Delete the relevant rows.
+                Ok(env.instance_env.datastore_delete_by_index_scan_multi_range_bsatn(
+                    index_id.into(),
+                    num_cols,
+                    bounds,
+                )?)
+            },
+        )
     }
 
     /// Deprecated name for [`Self::datastore_delete_by_index_scan_range_bsatn`].

@@ -69,8 +69,8 @@ use spacetimedb_table::{
     indexes::{RowPointer, SquashedOffset},
     static_assert_size,
     table::{
-        BlobNumBytes, DuplicateError, IndexScanPointIter, IndexScanRangeIter, InsertError, RowRef, Table,
-        TableAndIndex, UniqueConstraintViolation,
+        BlobNumBytes, DuplicateError, IndexMultiScanRangeIter, IndexScanPointIter, IndexScanRangeIter, InsertError,
+        RowRef, Table, TableAndIndex, UniqueConstraintViolation,
     },
     table_index::{IndexCannotSeekRange, IndexKey, IndexSeekRangeResult, PointOrRange, TableIndex},
 };
@@ -1641,6 +1641,45 @@ impl MutTxId {
         Ok((table_id, iter))
     }
 
+    /// Performs a multi-range ("skip scan") index scan, where each leading indexed column may
+    /// carry its own range, decoded from `bounds` (see [`TableIndex::multi_bounds_from_bsatn`]).
+    ///
+    /// `num_cols` is the number of constrained leading columns.
+    /// The committed-state and tx-state skip scans are chained and tx-deleted rows filtered out,
+    /// exactly as for [`MutTxId::index_scan_range`].
+    pub fn index_scan_multi_range<'a>(
+        &'a self,
+        index_id: IndexId,
+        num_cols: ColId,
+        bounds: &[u8],
+    ) -> Result<(TableId, IndexScanMultiRanged<'a>)> {
+        // Extract the table id, and commit/tx indices.
+        let (table_id, commit_index, tx_index) = self
+            .get_table_and_index(index_id)
+            .ok_or_else(|| IndexError::NotFound(index_id))?;
+
+        // Decode the per-column bounds.
+        let ranges = commit_index
+            .index()
+            .multi_bounds_from_bsatn(num_cols, bounds)
+            .map_err(IndexError::Decode)?;
+
+        // Get a skip-scan iterator for each of the tx and committed states.
+        let tx_iter = tx_index.map(|i| i.seek_multi_range(&ranges)).transpose();
+        let commit_iter = commit_index.seek_multi_range(&ranges);
+        let (tx_iter, commit_iter) = match (tx_iter, commit_iter) {
+            (Ok(t), Ok(c)) => (t, c),
+            (Err(IndexCannotSeekRange), _) | (_, Err(IndexCannotSeekRange)) => {
+                return Err(IndexError::IndexCannotSeekRange(index_id).into())
+            }
+        };
+
+        // Combine it all, filtering tx-deleted rows out of the committed results.
+        let dt = self.tx_state.get_delete_table(table_id);
+        let iter = ScanMutTx::combine(dt, tx_iter, commit_iter);
+        Ok((table_id, iter))
+    }
+
     /// See [`MutTxId::index_scan_range`].
     #[inline(always)]
     fn index_scan_range_via_algebraic_value<'a>(
@@ -2518,6 +2557,9 @@ impl<'a> RowRefInsertion<'a> {
 
 /// The iterator returned by [`MutTxId::index_scan_range`].
 pub type IndexScanRanged<'a> = ScanMutTx<'a, IndexScanRangeIter<'a>>;
+
+/// The iterator returned by [`MutTxId::index_scan_multi_range`].
+pub type IndexScanMultiRanged<'a> = ScanMutTx<'a, IndexMultiScanRangeIter<'a>>;
 
 /// The iterator returned by [`MutTxId::index_scan_point`].
 pub type IndexScanPoint<'a> = ScanMutTx<'a, IndexScanPointIter<'a>>;

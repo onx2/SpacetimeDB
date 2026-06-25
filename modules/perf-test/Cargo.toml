@@ -10,5 +10,7 @@ license-file = "LICENSE"
 crate-type = ["cdylib"]
 
 [dependencies]
-spacetimedb = { path = "../../crates/bindings" }
+# `unstable` enables the multi-range ("skip scan") `filter(..)` overload used by the
+# spatial-grid benchmark reducers below.
+spacetimedb = { path = "../../crates/bindings", features = ["unstable"] }
 log.workspace = true
