@@ -2273,6 +2273,52 @@ impl TableIndex {
         }
     }
 
+    /// Decodes per-column bounds for a multi-range ("skip scan") index scan from BSATN.
+    ///
+    /// `num_cols` is the number of leading indexed columns that are constrained.
+    /// The `bounds` buffer is, for each such column `i` in order, a BSATN-encoded
+    /// `Bound<col_i>` start followed by a `Bound<col_i>` end, where the `Bound` tag is
+    /// serialized as for `Bound<()>` and `Included`/`Excluded` carry the column value.
+    ///
+    /// Unlike [`Self::bounds_from_bsatn`], which yields a single contiguous range, this returns
+    /// an independent `(start, end)` bound for *each* leading column, suitable for
+    /// [`TableAndIndex::seek_multi_range`](crate::table::TableAndIndex::seek_multi_range).
+    pub fn multi_bounds_from_bsatn(
+        &self,
+        num_cols: ColId,
+        bounds: &[u8],
+    ) -> DecodeResult<Vec<(Bound<AlgebraicValue>, Bound<AlgebraicValue>)>> {
+        let num_cols = num_cols.idx();
+
+        // Constraining more than one column requires a product (multi-column) key type.
+        let AlgebraicType::Product(key_types) = &self.key_type else {
+            return Err(DecodeError::custom("multi-range scan requires a multi-column index"));
+        };
+        let col_types = &*key_types.elements;
+        if num_cols == 0 || num_cols > col_types.len() {
+            return Err(DecodeError::custom("multi-range scan column count out of range"));
+        }
+
+        /// Reads one `Bound<col_type>` from `reader`, advancing it.
+        fn read_av_bound(ty: &AlgebraicType, reader: &mut &[u8]) -> DecodeResult<Bound<AlgebraicValue>> {
+            Ok(match from_reader::<Bound<()>>(reader)? {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(()) => Bound::Included(AlgebraicValue::decode(ty, reader)?),
+                Bound::Excluded(()) => Bound::Excluded(AlgebraicValue::decode(ty, reader)?),
+            })
+        }
+
+        let reader = &mut { bounds };
+        let mut out = Vec::with_capacity(num_cols);
+        for col_type in &col_types[..num_cols] {
+            let ty = &col_type.algebraic_type;
+            let start = read_av_bound(ty, reader)?;
+            let end = read_av_bound(ty, reader)?;
+            out.push((start, end));
+        }
+        Ok(out)
+    }
+
     /// Splits `key_types` into a prefix types and range type
     /// and returns how large the suffix after the range type is.
     fn split_key_types<E: de::Error>(

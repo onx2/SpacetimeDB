@@ -508,6 +508,23 @@ impl InstanceEnv {
         Ok(Self::datastore_delete_by_index_scan(stdb, tx, table_id, rows_to_delete))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub fn datastore_delete_by_index_scan_multi_range_bsatn(
+        &self,
+        index_id: IndexId,
+        num_cols: ColId,
+        bounds: &[u8],
+    ) -> Result<u32, NodesError> {
+        let stdb = self.relational_db();
+        let tx = &mut *self.get_tx()?;
+
+        // Find all rows matching the multi-range ("skip scan") query to delete.
+        let (table_id, iter) = stdb.index_scan_multi_range(tx, index_id, num_cols, bounds)?;
+        let rows_to_delete = iter.map(|row_ref| row_ref.pointer()).collect();
+
+        Ok(Self::datastore_delete_by_index_scan(stdb, tx, table_id, rows_to_delete))
+    }
+
     /// Deletes `rows_to_delete` in `tx`
     /// and assumes `rows_to_delete` came from an index scan.
     fn datastore_delete_by_index_scan(
@@ -695,6 +712,35 @@ impl InstanceEnv {
         tx.metrics.rows_scanned += rows_scanned;
 
         tx.record_index_scan_range(&self.func_type, table_id, index_id, point);
+
+        Ok(chunks)
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub fn datastore_index_scan_multi_range_bsatn_chunks(
+        &self,
+        pool: &mut ChunkPool,
+        index_id: IndexId,
+        num_cols: ColId,
+        bounds: &[u8],
+    ) -> Result<Vec<Vec<u8>>, NodesError> {
+        let tx = &mut *self.get_tx()?;
+
+        // Open the skip-scan iterator.
+        let (table_id, iter) = self
+            .relational_db()
+            .index_scan_multi_range(tx, index_id, num_cols, bounds)?;
+
+        // Scan the index and serialize rows to BSATN.
+        let (chunks, rows_scanned, bytes_scanned) = ChunkedWriter::collect_iter(pool, iter);
+
+        // Record the number of rows and the number of bytes scanned by the iterator.
+        tx.metrics.index_seeks += 1;
+        tx.metrics.bytes_scanned += bytes_scanned;
+        tx.metrics.rows_scanned += rows_scanned;
+
+        // Conservatively record this as a non-point range scan in the view read set.
+        tx.record_index_scan_range(&self.func_type, table_id, index_id, None);
 
         Ok(chunks)
     }

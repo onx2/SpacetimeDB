@@ -148,6 +148,21 @@ impl<Bound: FilterableValue> TermBound<&Bound> {
             rend_idx
         })
     }
+
+    /// Serializes this column's bound as a `Bound<Arg>` start followed by a `Bound<Arg>` end,
+    /// as expected per-column by the multi-range ("skip scan") host call
+    /// `datastore_index_scan_multi_range_bsatn`.
+    ///
+    /// A point (`Single`) is encoded as `Included(v)` for both endpoints.
+    #[inline]
+    pub fn serialize_col_bounds_into(&self, buf: &mut Vec<u8>) {
+        let (start, end) = match self {
+            TermBound::Single(elem) => (elem, elem),
+            TermBound::Range(start, end) => (start, end),
+        };
+        bsatn::to_writer(buf, start).unwrap();
+        bsatn::to_writer(buf, end).unwrap();
+    }
 }
 pub trait IndexScanRangeBoundsTerminator {
     /// Whether this bound terminator is a point.

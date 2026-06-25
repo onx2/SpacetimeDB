@@ -18,7 +18,7 @@ use spacetimedb_datastore::locking_tx_datastore::state_view::{
     IterByColEqMutTx, IterByColRangeMutTx, IterMutTx, StateView,
 };
 use spacetimedb_datastore::locking_tx_datastore::{
-    ApplyHistoryCounters, IndexScanPointOrRange, MutTxId, TxId, ViewCallInfo,
+    ApplyHistoryCounters, IndexScanMultiRanged, IndexScanPointOrRange, MutTxId, TxId, ViewCallInfo,
 };
 use spacetimedb_datastore::system_tables::{
     system_tables, StModuleRow, ST_CLIENT_ID, ST_CONNECTION_CREDENTIALS_ID, ST_VIEW_SUB_ID,
@@ -1485,6 +1485,17 @@ impl RelationalDB {
         rend: &'de [u8],
     ) -> Result<(TableId, IndexScanPointOrRange<'de, 'a>), DBError> {
         Ok(tx.index_scan_range(index_id, prefix, prefix_elems, rstart, rend)?)
+    }
+
+    /// Performs a multi-range ("skip scan") index scan; see [`MutTxId::index_scan_multi_range`].
+    pub fn index_scan_multi_range<'a>(
+        &'a self,
+        tx: &'a MutTx,
+        index_id: IndexId,
+        num_cols: ColId,
+        bounds: &[u8],
+    ) -> Result<(TableId, IndexScanMultiRanged<'a>), DBError> {
+        Ok(tx.index_scan_multi_range(index_id, num_cols, bounds)?)
     }
 
     pub fn index_scan_point<'a, 'p>(

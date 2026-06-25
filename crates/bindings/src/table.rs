@@ -961,11 +961,36 @@ impl<Tbl: Table, IndexType, Idx: IndexIsRanged> RangedIndex<Tbl, IndexType, Idx>
                     .into()
             })
         } else {
-            let args = b.get_range_args();
-            let (prefix, prefix_elems, rstart, rend) = args.args_for_syscall();
-            sys::datastore_delete_by_index_scan_range_bsatn(index_id, prefix, prefix_elems, rstart, rend)
-                .unwrap_or_else(|e| panic!("unexpected error from `datastore_delete_by_index_scan_range_bsatn`: {e}"))
-                .into()
+            #[cfg(feature = "unstable")]
+            {
+                if const { B::SINGLE_RANGE } {
+                    let args = b.get_range_args();
+                    let (prefix, prefix_elems, rstart, rend) = args.args_for_syscall();
+                    sys::datastore_delete_by_index_scan_range_bsatn(index_id, prefix, prefix_elems, rstart, rend)
+                        .unwrap_or_else(|e| {
+                            panic!("unexpected error from `datastore_delete_by_index_scan_range_bsatn`: {e}")
+                        })
+                        .into()
+                } else {
+                    let args = b.get_multi_range_args();
+                    let (num_cols, bounds) = args.args_for_syscall();
+                    sys::datastore_delete_by_index_scan_multi_range_bsatn(index_id, num_cols, bounds)
+                        .unwrap_or_else(|e| {
+                            panic!("unexpected error from `datastore_delete_by_index_scan_multi_range_bsatn`: {e}")
+                        })
+                        .into()
+                }
+            }
+            #[cfg(not(feature = "unstable"))]
+            {
+                let args = b.get_range_args();
+                let (prefix, prefix_elems, rstart, rend) = args.args_for_syscall();
+                sys::datastore_delete_by_index_scan_range_bsatn(index_id, prefix, prefix_elems, rstart, rend)
+                    .unwrap_or_else(|e| {
+                        panic!("unexpected error from `datastore_delete_by_index_scan_range_bsatn`: {e}")
+                    })
+                    .into()
+            }
         }
     }
 }
@@ -985,10 +1010,28 @@ where
     let iter = if const { is_point_scan::<Idx, B, _, _>() } {
         b.with_point_arg(|point| datastore_index_scan_point_bsatn(index_id, point))
     } else {
-        let args = b.get_range_args();
-        let (prefix, prefix_elems, rstart, rend) = args.args_for_syscall();
-        sys::datastore_index_scan_range_bsatn(index_id, prefix, prefix_elems, rstart, rend)
-            .unwrap_or_else(|e| panic!("unexpected error from `datastore_index_scan_range_bsatn`: {e}"))
+        #[cfg(feature = "unstable")]
+        {
+            if const { B::SINGLE_RANGE } {
+                let args = b.get_range_args();
+                let (prefix, prefix_elems, rstart, rend) = args.args_for_syscall();
+                sys::datastore_index_scan_range_bsatn(index_id, prefix, prefix_elems, rstart, rend)
+                    .unwrap_or_else(|e| panic!("unexpected error from `datastore_index_scan_range_bsatn`: {e}"))
+            } else {
+                // A non-terminal column carries a range: use the multi-range ("skip scan") host call.
+                let args = b.get_multi_range_args();
+                let (num_cols, bounds) = args.args_for_syscall();
+                sys::datastore_index_scan_multi_range_bsatn(index_id, num_cols, bounds)
+                    .unwrap_or_else(|e| panic!("unexpected error from `datastore_index_scan_multi_range_bsatn`: {e}"))
+            }
+        }
+        #[cfg(not(feature = "unstable"))]
+        {
+            let args = b.get_range_args();
+            let (prefix, prefix_elems, rstart, rend) = args.args_for_syscall();
+            sys::datastore_index_scan_range_bsatn(index_id, prefix, prefix_elems, rstart, rend)
+                .unwrap_or_else(|e| panic!("unexpected error from `datastore_index_scan_range_bsatn`: {e}"))
+        }
     };
 
     TableIter::new(iter)
@@ -1042,6 +1085,14 @@ pub trait IndexScanRangeBounds<T, K = ()> {
     #[doc(hidden)]
     const COLS_PROVIDED: usize;
 
+    /// `true` when at most the *last* provided column is a range,
+    /// so the single-range host call (`datastore_index_scan_range_bsatn`) suffices.
+    /// `false` when a non-terminal column carries a range, requiring a multi-range skip scan.
+    /// For `(42, 12..24)` it's `true`; for `(0..=2, 0..=2)` it's `false`.
+    #[cfg(feature = "unstable")]
+    #[doc(hidden)]
+    const SINGLE_RANGE: bool = true;
+
     // TODO(perf, centril): once we have stable specialization,
     // just use `to_le_bytes` internally instead.
     #[doc(hidden)]
@@ -1049,6 +1100,14 @@ pub trait IndexScanRangeBounds<T, K = ()> {
 
     #[doc(hidden)]
     fn get_range_args(&self) -> IndexScanRangeArgs;
+
+    /// Serializes per-column bounds for the multi-range ("skip scan") host call.
+    /// Only meaningful (and only called) when [`Self::SINGLE_RANGE`] is `false`.
+    #[cfg(feature = "unstable")]
+    #[doc(hidden)]
+    fn get_multi_range_args(&self) -> IndexScanMultiRangeArgs {
+        unimplemented!("`get_multi_range_args` called on a non-multi-range bound")
+    }
 }
 
 #[doc(hidden)]
@@ -1062,6 +1121,25 @@ pub struct IndexScanRangeArgs {
     rstart_idx: usize,
     // None if rstart and rend are the same
     rend_idx: Option<usize>,
+}
+
+/// Arguments to the multi-range ("skip scan") index-scan host-/sys-calls.
+///
+/// `data` holds, for each of the `num_cols` constrained leading columns in order,
+/// a BSATN-encoded `Bound<col>` start followed by a `Bound<col>` end.
+#[doc(hidden)]
+#[cfg(feature = "unstable")]
+pub struct IndexScanMultiRangeArgs {
+    data: IterBuf,
+    num_cols: usize,
+}
+
+#[cfg(feature = "unstable")]
+impl IndexScanMultiRangeArgs {
+    /// Returns the number of constrained columns and the encoded per-column bounds buffer.
+    pub(crate) fn args_for_syscall(&self) -> (ColId, &[u8]) {
+        (ColId::from(self.num_cols), &self.data[..])
+    }
 }
 
 impl IndexScanRangeArgs {
@@ -1080,6 +1158,8 @@ impl IndexScanRangeArgs {
 
 // Implement `IndexScanRangeBounds` for all the different index column types
 // and filter argument types we support.
+// Under `unstable`, this is superseded by `impl_index_scan_range_bounds_unstable!` (see below).
+#[cfg(not(feature = "unstable"))]
 macro_rules! impl_index_scan_range_bounds {
     // In the first pattern, we accept two Prolog-style lists of type variables,
     // the first of which we use for the column types in the index,
@@ -1247,7 +1327,143 @@ macro_rules! impl_index_scan_range_bounds {
 
 pub struct SingleBound;
 
+#[cfg(not(feature = "unstable"))]
 impl_index_scan_range_bounds!(
+    (ColA, ColB, ColC, ColD, ColE, ColF),
+    (ArgA, ArgB, ArgC, ArgD, ArgE, ArgF)
+);
+
+// When `unstable` is enabled, a *uniform* set of impls replaces the ones above:
+// every provided column is an `IndexScanRangeBoundsTerminator` (a point or a range),
+// rather than requiring all-but-the-last to be points. This makes multi-range ("skip scan")
+// queries like `(0..=2, 0..=2)` type-check, while still supporting points and single ranges.
+//
+// The two impl sets are mutually exclusive via `cfg`, so there is never any trait-resolution
+// ambiguity. Existing (non-`unstable`) builds are byte-for-byte unaffected.
+#[cfg(feature = "unstable")]
+macro_rules! impl_index_scan_range_bounds_unstable {
+    // Outer recursion over index column arities (mirrors `impl_index_scan_range_bounds!`).
+    (($ColTerminator:ident $(, $ColPrefix:ident)*), ($ArgTerminator:ident $(, $ArgPrefix:ident)*)) => {
+        impl_index_scan_range_bounds_unstable!(@inner_recursion (), ($ColTerminator $(, $ColPrefix)*), ($ArgTerminator $(, $ArgPrefix)*));
+        impl_index_scan_range_bounds_unstable!(($($ColPrefix),*), ($($ArgPrefix),*));
+    };
+    ((), ()) => {};
+
+    // Inner recursion: emit for M-element queries on N-column indexes, then for (M-1).
+    (@inner_recursion ($($ColUnused:ident),*), ($ColTerminator:ident $(, $ColPrefix:ident)+), ($ArgTerminator:ident $(, $ArgPrefix:ident)+)) => {
+        impl_index_scan_range_bounds_unstable!(@emit_impl ($($ColUnused),*), ($ColTerminator $(,$ColPrefix)*), ($ArgTerminator $(, $ArgPrefix)*));
+        impl_index_scan_range_bounds_unstable!(@inner_recursion ($($ColUnused,)* $ColTerminator), ($($ColPrefix),*), ($($ArgPrefix),*));
+    };
+
+    // Base case: a single provided column. Identical in shape to the stable base case.
+    (@inner_recursion ($($ColUnused:ident),*), ($ColTerminator:ident), ($ArgTerminator:ident)) => {
+        impl<
+            $($ColUnused,)*
+            $ColTerminator,
+            Term: IndexScanRangeBoundsTerminator<Arg = $ArgTerminator>,
+            $ArgTerminator: FilterableValue<Column = $ColTerminator>,
+        > IndexScanRangeBounds<($ColTerminator, $($ColUnused,)*)> for (Term,) {
+            const POINT: bool = Term::POINT;
+            const COLS_PROVIDED: usize = 1;
+            const SINGLE_RANGE: bool = true;
+
+            fn with_point_arg<R>(&self, run: impl FnOnce(&[u8]) -> R) -> R {
+                IndexScanRangeBounds::<($ColTerminator, $($ColUnused,)*), SingleBound>::with_point_arg(&self.0, run)
+            }
+            fn get_range_args(&self) -> IndexScanRangeArgs {
+                IndexScanRangeBounds::<($ColTerminator, $($ColUnused,)*), SingleBound>::get_range_args(&self.0)
+            }
+            fn get_multi_range_args(&self) -> IndexScanMultiRangeArgs {
+                IndexScanRangeBounds::<($ColTerminator, $($ColUnused,)*), SingleBound>::get_multi_range_args(&self.0)
+            }
+        }
+        impl<
+            $($ColUnused,)*
+            $ColTerminator,
+            Term: IndexScanRangeBoundsTerminator<Arg = $ArgTerminator>,
+            $ArgTerminator: FilterableValue<Column = $ColTerminator>,
+        > IndexScanRangeBounds<($ColTerminator, $($ColUnused,)*), SingleBound> for Term {
+            const POINT: bool = Term::POINT;
+            const COLS_PROVIDED: usize = 1;
+            const SINGLE_RANGE: bool = true;
+
+            fn with_point_arg<R>(&self, run: impl FnOnce(&[u8]) -> R) -> R {
+                run(&IterBuf::serialize(self.point()).unwrap())
+            }
+            fn get_range_args(&self) -> IndexScanRangeArgs {
+                let mut data = IterBuf::take();
+                let rend_idx = self.bounds().serialize_into(&mut data);
+                IndexScanRangeArgs { data, prefix_elems: 0, rstart_idx: 0, rend_idx }
+            }
+            fn get_multi_range_args(&self) -> IndexScanMultiRangeArgs {
+                let mut data = IterBuf::take();
+                self.bounds().serialize_col_bounds_into(&mut data);
+                IndexScanMultiRangeArgs { data, num_cols: 1 }
+            }
+        }
+    };
+
+    // Emit for M > 1: every provided column (prefix + terminator) is a terminator.
+    (@emit_impl ($($ColUnused:ident),*), ($ColTerminator:ident $(, $ColPrefix:ident)+), ($ArgTerminator:ident $(, $ArgPrefix:ident)+)) => {
+        impl<
+            $($ColUnused,)*
+            $ColTerminator,
+            $($ColPrefix,)+
+            Term: IndexScanRangeBoundsTerminator<Arg = $ArgTerminator>,
+            $ArgTerminator: FilterableValue<Column = $ColTerminator>,
+            $($ArgPrefix: IndexScanRangeBoundsTerminator,)+
+        > IndexScanRangeBounds<
+            ($($ColPrefix,)+ $ColTerminator, $($ColUnused,)*)
+        > for ($($ArgPrefix,)+ Term,)
+        where
+            $(<$ArgPrefix as IndexScanRangeBoundsTerminator>::Arg: FilterableValue<Column = $ColPrefix>,)+
+        {
+            const POINT: bool = Term::POINT $(&& <$ArgPrefix as IndexScanRangeBoundsTerminator>::POINT)+;
+            const COLS_PROVIDED: usize = 1 + impl_index_scan_range_bounds_unstable!(@count $($ColPrefix)+);
+            const SINGLE_RANGE: bool = true $(&& <$ArgPrefix as IndexScanRangeBoundsTerminator>::POINT)+;
+
+            fn with_point_arg<R>(&self, run: impl FnOnce(&[u8]) -> R) -> R {
+                let mut data = IterBuf::take();
+                #[allow(non_snake_case)]
+                let ($($ArgPrefix,)+ term,) = self;
+                Ok(())
+                    $(.and_then(|()| data.serialize_into($ArgPrefix.point())))+
+                    .and_then(|()| data.serialize_into(term.point()))
+                    .unwrap();
+                run(&data)
+            }
+
+            fn get_range_args(&self) -> IndexScanRangeArgs {
+                let mut data = IterBuf::take();
+                let prefix_elems = impl_index_scan_range_bounds_unstable!(@count $($ColPrefix)+);
+                #[allow(non_snake_case)]
+                let ($($ArgPrefix,)+ term,) = self;
+                Ok(())
+                    $(.and_then(|()| data.serialize_into($ArgPrefix.point())))+
+                    .unwrap();
+                let rstart_idx = data.len();
+                let rend_idx = term.bounds().serialize_into(&mut data);
+                IndexScanRangeArgs { data, prefix_elems, rstart_idx, rend_idx }
+            }
+
+            fn get_multi_range_args(&self) -> IndexScanMultiRangeArgs {
+                let mut data = IterBuf::take();
+                let num_cols = 1 + impl_index_scan_range_bounds_unstable!(@count $($ColPrefix)+);
+                #[allow(non_snake_case)]
+                let ($($ArgPrefix,)+ term,) = self;
+                $(<$ArgPrefix as IndexScanRangeBoundsTerminator>::bounds($ArgPrefix).serialize_col_bounds_into(&mut data);)+
+                term.bounds().serialize_col_bounds_into(&mut data);
+                IndexScanMultiRangeArgs { data, num_cols }
+            }
+        }
+    };
+
+    (@count $($T:ident)*) => { 0 $(+ impl_index_scan_range_bounds_unstable!(@drop $T 1))* };
+    (@drop $a:tt $b:tt) => { $b };
+}
+
+#[cfg(feature = "unstable")]
+impl_index_scan_range_bounds_unstable!(
     (ColA, ColB, ColC, ColD, ColE, ColF),
     (ArgA, ArgB, ArgC, ArgD, ArgE, ArgF)
 );

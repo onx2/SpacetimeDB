@@ -883,6 +883,61 @@ pub mod raw {
         pub fn datastore_clear(table_id: TableId, out: *mut u64) -> u16;
     }
 
+    // See comment on the first `extern "C"` block re: ABI version.
+    // This block is `unstable`: only modules built with the `unstable` feature import it,
+    // so it is an additive, non-breaking ABI extension.
+    #[cfg(feature = "unstable")]
+    #[link(wasm_import_module = "spacetime_10.6")]
+    unsafe extern "C" {
+        /// Finds all rows in the index identified by `index_id` that match a *multi-range*
+        /// ("skip scan") query, and writes a `RowIter` for them to `out`.
+        ///
+        /// Unlike [`datastore_index_scan_range_bsatn`], which takes an equality prefix plus a
+        /// single terminal range, this constrains each of the leading `num_cols` indexed columns
+        /// with its own range. The `bounds = bounds_ptr[..bounds_len]` buffer contains, for each
+        /// of the `num_cols` columns in order, a BSATN-encoded `Bound<AlgebraicValue>` start
+        /// followed by a `Bound<AlgebraicValue>` end. The inner `AlgebraicValue`s are typed at
+        /// the index's leading `num_cols` key column types.
+        ///
+        /// This enables, e.g. on an index `(x, z)`, a `(0..=2, 0..=2)` grid query, which is not
+        /// expressible as a single contiguous B-tree range.
+        ///
+        /// # Traps
+        ///
+        /// Traps if:
+        /// - `bounds_ptr` is NULL or `bounds` is not in bounds of WASM memory.
+        /// - `out` is NULL or `out[..size_of::<RowIter>()]` is not in bounds of WASM memory.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error:
+        ///
+        /// - `NOT_IN_TRANSACTION`, when called outside of a transaction.
+        /// - `NO_SUCH_INDEX`, when `index_id` is not a known ID of an index.
+        /// - `WRONG_INDEX_ALGO` if the index is not a range-compatible index.
+        /// - `BSATN_DECODE_ERROR`, when `bounds` cannot be decoded to `num_cols` pairs of
+        ///   `Bound<AlgebraicValue>` typed at the index's leading `num_cols` column types.
+        pub fn datastore_index_scan_multi_range_bsatn(
+            index_id: IndexId,
+            num_cols: ColId,
+            bounds_ptr: *const u8, // [(Bound<AlgebraicValue>, Bound<AlgebraicValue>); num_cols]
+            bounds_len: usize,
+            out: *mut RowIter,
+        ) -> u16;
+
+        /// Deletes all rows found by [`datastore_index_scan_multi_range_bsatn`]
+        /// with the same arguments. The number of rows deleted is written to `out`.
+        ///
+        /// See [`datastore_index_scan_multi_range_bsatn`] for the encoding and error details.
+        pub fn datastore_delete_by_index_scan_multi_range_bsatn(
+            index_id: IndexId,
+            num_cols: ColId,
+            bounds_ptr: *const u8, // [(Bound<AlgebraicValue>, Bound<AlgebraicValue>); num_cols]
+            bounds_len: usize,
+            out: *mut u32,
+        ) -> u16;
+    }
+
     /// What strategy does the database index use?
     ///
     /// See also: <https://www.postgresql.org/docs/current/sql-createindex.html>
@@ -1329,6 +1384,42 @@ pub fn datastore_index_scan_range_bsatn(
         })?
     };
     Ok(RowIter { raw })
+}
+
+/// Finds all rows matching a multi-range ("skip scan") query in the index `index_id`,
+/// where each of the leading `num_cols` indexed columns is constrained by its own range,
+/// encoded in `bounds`.
+///
+/// See [`raw::datastore_index_scan_multi_range_bsatn`] for the encoding and error details.
+#[cfg(feature = "unstable")]
+pub fn datastore_index_scan_multi_range_bsatn(index_id: IndexId, num_cols: ColId, bounds: &[u8]) -> Result<RowIter> {
+    let raw = unsafe {
+        call(|out| raw::datastore_index_scan_multi_range_bsatn(index_id, num_cols, bounds.as_ptr(), bounds.len(), out))?
+    };
+    Ok(RowIter { raw })
+}
+
+/// Deletes all rows matching a multi-range ("skip scan") query in the index `index_id`,
+/// returning the number of rows deleted.
+///
+/// See [`raw::datastore_delete_by_index_scan_multi_range_bsatn`].
+#[cfg(feature = "unstable")]
+pub fn datastore_delete_by_index_scan_multi_range_bsatn(
+    index_id: IndexId,
+    num_cols: ColId,
+    bounds: &[u8],
+) -> Result<u32> {
+    unsafe {
+        call(|out| {
+            raw::datastore_delete_by_index_scan_multi_range_bsatn(
+                index_id,
+                num_cols,
+                bounds.as_ptr(),
+                bounds.len(),
+                out,
+            )
+        })
+    }
 }
 
 /// Deletes all rows found in the index identified by `index_id`,

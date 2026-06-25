@@ -15,7 +15,9 @@ use super::{
     static_assert_size,
     static_bsatn_validator::{static_bsatn_validator, validate_bsatn, StaticBsatnValidator},
     static_layout::StaticLayout,
-    table_index::{IndexCannotSeekRange, IndexKey, IndexKind, TableIndex, TableIndexPointIter, TableIndexRangeIter},
+    table_index::{
+        IndexCannotSeekRange, IndexKey, IndexKind, PointOrRange, TableIndex, TableIndexPointIter, TableIndexRangeIter,
+    },
     var_len::VarLenMembers,
 };
 use core::{fmt, ptr};
@@ -23,7 +25,10 @@ use core::{
     hash::{Hash, Hasher},
     hint::unreachable_unchecked,
 };
-use core::{mem, ops::RangeBounds};
+use core::{
+    mem,
+    ops::{Bound, RangeBounds},
+};
 use derive_more::{Add, AddAssign, From, Sub, SubAssign};
 use enum_as_inner::EnumAsInner;
 use itertools::Itertools;
@@ -2268,6 +2273,54 @@ impl<'a> TableAndIndex<'a> {
             btree_index_iter,
         })
     }
+
+    /// Returns an iterator yielding all rows matching a *multi-range* ("skip scan") query.
+    ///
+    /// Unlike [`Self::seek_range`], which supports an equality prefix plus a *single* terminal
+    /// range, this allows *every* leading indexed column to carry its own range (or point).
+    /// `ranges[i]` constrains the `i`-th indexed column; a point is `(Included(v), Included(v))`.
+    /// Columns beyond `ranges.len()` are left unconstrained (the suffix).
+    ///
+    /// For example, on an index `(x, z)`, `[0..=2, 0..=2]` yields the 3x3 grid
+    /// `x in [0,2] AND z in [0,2]`, which is *not* a contiguous slice of the B-tree's
+    /// lexicographic ordering and thus is not expressible via [`Self::seek_range`].
+    ///
+    /// This is evaluated as a loose index scan / *skip scan*: for each non-terminal ranged
+    /// column, only the distinct values that *actually occur* in the index are enumerated,
+    /// and a sub-scan is performed for each. Cost is roughly `O(D * log N)` B-tree descents,
+    /// where `D` is the number of distinct leading tuples in range. This is efficient when the
+    /// leading ranged columns have low cardinality, and degrades towards a full scan otherwise.
+    ///
+    /// Returns [`IndexCannotSeekRange`] if the index is not range-capable (e.g. a hash index).
+    /// Within a single index, rows are yielded in key order.
+    pub fn seek_multi_range(
+        &self,
+        ranges: &[IndexColBound],
+    ) -> Result<IndexMultiScanRangeIter<'a>, IndexCannotSeekRange> {
+        if !self.index.is_ranged() {
+            return Err(IndexCannotSeekRange);
+        }
+        Ok(IndexMultiScanRangeIter::new(*self, ranges))
+    }
+
+    /// Seeks the index with an equality `prefix` followed by a single `range` on the next column.
+    ///
+    /// The range may collapse to a point scan when it is an inclusive single value with no
+    /// unconstrained suffix columns; both cases are unified by the returned iterator.
+    ///
+    /// The returned iterator borrows only `self` (`'a`), not `prefix` or `range`, since the
+    /// bounds are consumed while locating the B-tree cursors.
+    fn seek_prefix_range(&self, prefix: &[AlgebraicValue], range: &IndexColBound) -> IndexScanPointOrRangeIter<'a> {
+        let prefix_pv: ProductValue = prefix.iter().cloned().collect();
+        match self.index.bounds_from_algbraic_value(&prefix_pv, range) {
+            Ok(PointOrRange::Point(point)) => IndexScanPointOrRangeIter::Point(self.seek_point(&point)),
+            Ok(PointOrRange::Range(start, end)) => match self.seek_range(&(start, end)) {
+                Ok(it) => IndexScanPointOrRangeIter::Range(it),
+                Err(IndexCannotSeekRange) => IndexScanPointOrRangeIter::Empty,
+            },
+            Ok(PointOrRange::Unsupported) | Err(_) => IndexScanPointOrRangeIter::Empty,
+        }
+    }
 }
 
 /// An iterator using a [`TableIndex`] to scan a `table`
@@ -2323,6 +2376,182 @@ impl<'a> Iterator for IndexScanRangeIter<'a> {
             unsafe { self.table.get_row_ref_unchecked(self.blob_store, ptr) }
         })
     }
+}
+
+/// A per-column bound for a multi-range ("skip scan") index seek; see [`TableAndIndex::seek_multi_range`].
+///
+/// A point constraint on a column is expressed as `(Included(v), Included(v))`,
+/// and an unconstrained column as `(Unbounded, Unbounded)`.
+pub type IndexColBound = (Bound<AlgebraicValue>, Bound<AlgebraicValue>);
+
+/// A unified iterator over either a point or a range index scan, used internally by skip scan.
+enum IndexScanPointOrRangeIter<'a> {
+    Point(IndexScanPointIter<'a>),
+    Range(IndexScanRangeIter<'a>),
+    Empty,
+}
+
+impl<'a> Iterator for IndexScanPointOrRangeIter<'a> {
+    type Item = RowRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Point(it) => it.next(),
+            Self::Range(it) => it.next(),
+            Self::Empty => None,
+        }
+    }
+}
+
+/// The iterator returned by [`TableAndIndex::seek_multi_range`].
+///
+/// Implements a loose index scan ("skip scan") as an explicit-stack depth-first traversal of the
+/// index B-tree, with **no per-row allocation, boxing, or recursion**:
+/// - Leading point columns are folded into a fixed equality `prefix`.
+/// - Each non-terminal ranged column is "skipped" over only the distinct values that actually
+///   occur in the index (one B-tree probe per distinct value), reading just that one column.
+/// - The terminal column is a native contiguous range scan, drained row-by-row.
+///
+/// The inherent cost is the B-tree probes needed to discover distinct leading values; everything
+/// else is reused across groups.
+pub struct IndexMultiScanRangeIter<'a> {
+    index: TableAndIndex<'a>,
+    /// Per-column bounds; the last entry is the terminal (native-scan) column.
+    ranges: Arc<[IndexColBound]>,
+    /// Index of the terminal column, i.e. `ranges.len() - 1`.
+    terminal: usize,
+    /// Row column id of each indexed column, for cheap single-column reads.
+    col_ids: SmallVec<[ColId; 6]>,
+    /// Equality values fixed for columns `0..prefix.len()` on the current DFS path.
+    prefix: Vec<AlgebraicValue>,
+    /// Active skip columns on the current path: `(column index, next lower bound to probe)`.
+    skip_stack: Vec<(usize, Bound<AlgebraicValue>)>,
+    /// The current terminal sub-scan, drained row by row.
+    current: Option<IndexScanPointOrRangeIter<'a>>,
+    done: bool,
+}
+
+impl<'a> IndexMultiScanRangeIter<'a> {
+    fn new(index: TableAndIndex<'a>, ranges: &[IndexColBound]) -> Self {
+        // No constraints means the whole index; model it as a single unbounded terminal range.
+        // Callers (the module ABI) always pass at least one range, so this is just defensive.
+        let ranges: Arc<[IndexColBound]> = if ranges.is_empty() {
+            Arc::from([(Bound::Unbounded, Bound::Unbounded)])
+        } else {
+            Arc::from(ranges)
+        };
+        let terminal = ranges.len() - 1;
+        let col_ids = index.index().indexed_columns().iter().collect();
+        Self {
+            index,
+            ranges,
+            terminal,
+            col_ids,
+            prefix: Vec::with_capacity(terminal),
+            skip_stack: Vec::new(),
+            current: None,
+            done: false,
+        }
+    }
+
+    /// Probes for the smallest existing value of indexed column `col`, at-or-after `cursor` and
+    /// within the column's upper bound, under the current `prefix`. `None` if none exists.
+    fn probe(&self, col: usize, cursor: &Bound<AlgebraicValue>) -> Option<AlgebraicValue> {
+        let range = (cursor.clone(), self.ranges[col].1.clone());
+        let row = self.index.seek_prefix_range(&self.prefix, &range).next()?;
+        // Read just this one column rather than projecting the whole key.
+        let cols = ColList::new(self.col_ids[col]);
+        Some(row.project(&cols).expect("row belongs to this index's table"))
+    }
+
+    /// From the current `prefix`, fold point columns and probe skip columns until reaching the
+    /// terminal column, then open its sub-scan into `self.current`. Returns `false` if a skip
+    /// column on the way has no remaining value (a dead end).
+    fn descend(&mut self) -> bool {
+        loop {
+            let col = self.prefix.len();
+            if col == self.terminal {
+                self.current = Some(self.index.seek_prefix_range(&self.prefix, &self.ranges[col]));
+                return true;
+            }
+            let bound = &self.ranges[col];
+            if is_point_bound(bound) {
+                let Bound::Included(v) = &bound.0 else {
+                    unreachable!("`is_point_bound` guarantees an `Included` start")
+                };
+                let v = v.clone();
+                self.prefix.push(v);
+            } else {
+                let start = bound.0.clone();
+                match self.probe(col, &start) {
+                    Some(x) => {
+                        self.skip_stack.push((col, Bound::Excluded(x.clone())));
+                        self.prefix.push(x);
+                    }
+                    None => return false,
+                }
+            }
+        }
+    }
+
+    /// Backtracks to the deepest skip column and advances it to its next distinct value,
+    /// truncating `prefix` accordingly. Returns `false` when all skip columns are exhausted.
+    fn advance(&mut self) -> bool {
+        loop {
+            let (pos, cursor) = match self.skip_stack.last() {
+                Some(&(pos, ref cursor)) => (pos, cursor.clone()),
+                None => return false,
+            };
+            self.prefix.truncate(pos);
+            match self.probe(pos, &cursor) {
+                Some(x) => {
+                    self.skip_stack.last_mut().unwrap().1 = Bound::Excluded(x.clone());
+                    self.prefix.push(x);
+                    return true;
+                }
+                None => {
+                    self.skip_stack.pop();
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Iterator for IndexMultiScanRangeIter<'a> {
+    type Item = RowRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if self.current.is_none() {
+                // Open the next terminal sub-scan, backtracking past dead-end skip columns.
+                if !self.descend() {
+                    if !self.advance() {
+                        self.done = true;
+                        return None;
+                    }
+                    continue;
+                }
+            }
+            match self.current.as_mut().unwrap().next() {
+                Some(row) => return Some(row),
+                None => {
+                    self.current = None;
+                    if !self.advance() {
+                        self.done = true;
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether `bound` constrains a column to a single value, i.e. `Included(v)..=Included(v)`.
+fn is_point_bound(bound: &IndexColBound) -> bool {
+    matches!(bound, (Bound::Included(s), Bound::Included(e)) if s == e)
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -3068,5 +3297,223 @@ pub(crate) mod test {
                 RowPointer::new(false, PageIndex(0), PageOffset(0), SquashedOffset::COMMITTED_STATE),
             )
             .is_none());
+    }
+
+    // ---- multi-range ("skip scan") tests: `TableAndIndex::seek_multi_range` ----
+
+    /// Builds a table of `ty`, inserts the distinct `rows`, and adds a btree index on `cols`
+    /// as [`IndexId::SENTINEL`]. Returns the table and its blob store so a [`TableAndIndex`]
+    /// can be borrowed from them.
+    fn table_with_index(
+        ty: ProductType,
+        cols: ColList,
+        is_unique: bool,
+        rows: &[ProductValue],
+    ) -> (Table, HashMapBlobStore) {
+        let pool = PagePool::new_for_test();
+        let mut blob_store = HashMapBlobStore::default();
+        let mut tbl = table(ty.clone());
+        for row in rows {
+            tbl.insert(&pool, &mut blob_store, row).unwrap();
+        }
+        let index = TableIndex::new(&ty, cols, IndexKind::BTree, is_unique).unwrap();
+        // SAFETY: `ty` is the row type used to build both `tbl` and `index`.
+        unsafe { tbl.insert_index(&blob_store, IndexId::SENTINEL, index) }.unwrap();
+        (tbl, blob_store)
+    }
+
+    fn incl(v: impl Into<AlgebraicValue>) -> Bound<AlgebraicValue> {
+        Bound::Included(v.into())
+    }
+    fn excl(v: impl Into<AlgebraicValue>) -> Bound<AlgebraicValue> {
+        Bound::Excluded(v.into())
+    }
+    fn unb() -> Bound<AlgebraicValue> {
+        Bound::Unbounded
+    }
+
+    /// Runs `seek_multi_range` and returns the indexed-column projections, sorted.
+    fn multi_range_keys(tai: &TableAndIndex<'_>, ranges: &[IndexColBound]) -> Vec<AlgebraicValue> {
+        let mut out: Vec<_> = tai
+            .seek_multi_range(ranges)
+            .unwrap()
+            .map(|row| tai.index().project_row(row))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn seek_multi_range_grid_matches_manual_union() {
+        let ty: ProductType = [AlgebraicType::I8, AlgebraicType::I8].into();
+        let cols: ColList = [0, 1].into();
+
+        // A field of points, plus two far-away rows that must be excluded by the grid.
+        let mut rows = Vec::new();
+        for x in -2i8..=4 {
+            for z in -2i8..=4 {
+                rows.push(product![x, z]);
+            }
+        }
+        rows.push(product![50i8, 1i8]);
+        rows.push(product![1i8, 50i8]);
+
+        let (tbl, bs) = table_with_index(ty, cols, false, &rows);
+        let tai = tbl.get_index_by_id_with_table(&bs, IndexId::SENTINEL).unwrap();
+
+        // The 3x3 grid: x in [0,2] AND z in [0,2].
+        let grid = multi_range_keys(&tai, &[(incl(0i8), incl(2i8)), (incl(0i8), incl(2i8))]);
+
+        // Expected: the cartesian product {0,1,2} x {0,1,2}.
+        let mut expected = Vec::new();
+        for x in 0i8..=2 {
+            for z in 0i8..=2 {
+                expected.push(AlgebraicValue::Product(product![x, z]));
+            }
+        }
+        expected.sort();
+        assert_eq!(grid, expected);
+
+        // Identical to the union of three (x_eq, z_range) scans (the manual workaround),
+        // expressed here via a leading point that folds into the equality prefix.
+        let mut manual = Vec::new();
+        for x in 0i8..=2 {
+            for row in tai
+                .seek_multi_range(&[(incl(x), incl(x)), (incl(0i8), incl(2i8))])
+                .unwrap()
+            {
+                manual.push(tai.index().project_row(row));
+            }
+        }
+        manual.sort();
+        assert_eq!(grid, manual);
+    }
+
+    #[test]
+    fn seek_multi_range_excluded_and_unbounded() {
+        let ty: ProductType = [AlgebraicType::I8, AlgebraicType::I8].into();
+        let cols: ColList = [0, 1].into();
+        let mut rows = Vec::new();
+        for x in 0i8..=3 {
+            for z in 0i8..=3 {
+                rows.push(product![x, z]);
+            }
+        }
+        let (tbl, bs) = table_with_index(ty, cols, false, &rows);
+        let tai = tbl.get_index_by_id_with_table(&bs, IndexId::SENTINEL).unwrap();
+
+        // x in (0, 3] (excludes x=0), z in [0, 2) (excludes z=2,3) => x in {1,2,3}, z in {0,1}.
+        let got = multi_range_keys(&tai, &[(excl(0i8), incl(3i8)), (incl(0i8), excl(2i8))]);
+        let mut expected = Vec::new();
+        for x in 1i8..=3 {
+            for z in 0i8..=1 {
+                expected.push(AlgebraicValue::Product(product![x, z]));
+            }
+        }
+        expected.sort();
+        assert_eq!(got, expected);
+
+        // x unbounded, z = 2 (point in terminal position) => all x, z == 2.
+        let got = multi_range_keys(&tai, &[(unb(), unb()), (incl(2i8), incl(2i8))]);
+        let mut expected = Vec::new();
+        for x in 0i8..=3 {
+            expected.push(AlgebraicValue::Product(product![x, 2i8]));
+        }
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn seek_multi_range_three_cols_recursion() {
+        // Exercises recursion depth 2 (two skip columns) plus a mid/terminal mix.
+        let ty: ProductType = [AlgebraicType::I8, AlgebraicType::I8, AlgebraicType::I8].into();
+        let cols: ColList = [0, 1, 2].into();
+        let mut rows = Vec::new();
+        for x in 0i8..=2 {
+            for y in 0i8..=2 {
+                for z in 0i8..=2 {
+                    rows.push(product![x, y, z]);
+                }
+            }
+        }
+        let (tbl, bs) = table_with_index(ty, cols, false, &rows);
+        let tai = tbl.get_index_by_id_with_table(&bs, IndexId::SENTINEL).unwrap();
+
+        // x in [0,1], y in [0,1], z in [1,2].
+        let got = multi_range_keys(
+            &tai,
+            &[(incl(0i8), incl(1i8)), (incl(0i8), incl(1i8)), (incl(1i8), incl(2i8))],
+        );
+        let mut expected = Vec::new();
+        for x in 0i8..=1 {
+            for y in 0i8..=1 {
+                for z in 1i8..=2 {
+                    expected.push(AlgebraicValue::Product(product![x, y, z]));
+                }
+            }
+        }
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn seek_multi_range_av_path_string_leading() {
+        // A `(String, i32)` composite key is not fixed-size, so it uses the `BTreeAV`
+        // representation rather than a specialized `BytesKey`. Skip scan must work identically.
+        let ty: ProductType = [AlgebraicType::String, AlgebraicType::I32].into();
+        let cols: ColList = [0, 1].into();
+        let names = ["a", "b", "c", "d", "e"];
+        let mut rows = Vec::new();
+        for name in names {
+            for v in 0i32..=4 {
+                rows.push(product![name, v]);
+            }
+        }
+        let (tbl, bs) = table_with_index(ty, cols, false, &rows);
+        let tai = tbl.get_index_by_id_with_table(&bs, IndexId::SENTINEL).unwrap();
+
+        // name in ["b", "d"], v in [1, 3].
+        let got = multi_range_keys(&tai, &[(incl("b"), incl("d")), (incl(1i32), incl(3i32))]);
+        let mut expected = Vec::new();
+        for name in ["b", "c", "d"] {
+            for v in 1i32..=3 {
+                expected.push(AlgebraicValue::Product(product![name, v]));
+            }
+        }
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    proptest! {
+        /// Skip scan returns exactly the rows whose columns fall in the per-column bounds.
+        #[test]
+        fn seek_multi_range_matches_bruteforce(
+            rows in prop::collection::vec((any::<i8>(), any::<i8>()), 0..40),
+            xa in any::<i8>(), xb in any::<i8>(),
+            za in any::<i8>(), zb in any::<i8>(),
+        ) {
+            let (xlo, xhi) = (xa.min(xb), xa.max(xb));
+            let (zlo, zhi) = (za.min(zb), za.max(zb));
+
+            // Tables have set semantics, so insert only distinct rows.
+            let mut rows = rows;
+            rows.sort_unstable();
+            rows.dedup();
+
+            let ty: ProductType = [AlgebraicType::I8, AlgebraicType::I8].into();
+            let cols: ColList = [0, 1].into();
+            let pvs: Vec<ProductValue> = rows.iter().map(|&(x, z)| product![x, z]).collect();
+            let (tbl, bs) = table_with_index(ty, cols, false, &pvs);
+            let tai = tbl.get_index_by_id_with_table(&bs, IndexId::SENTINEL).unwrap();
+
+            let got = multi_range_keys(&tai, &[(incl(xlo), incl(xhi)), (incl(zlo), incl(zhi))]);
+
+            let mut expected: Vec<AlgebraicValue> = rows.iter()
+                .filter(|&&(x, z)| (xlo..=xhi).contains(&x) && (zlo..=zhi).contains(&z))
+                .map(|&(x, z)| AlgebraicValue::Product(product![x, z]))
+                .collect();
+            expected.sort();
+            prop_assert_eq!(got, expected);
+        }
     }
 }
