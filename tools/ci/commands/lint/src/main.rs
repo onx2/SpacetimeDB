@@ -344,6 +344,11 @@ fn main() -> Result<()> {
         "warnings",
     )
     .run()?;
+    // The Bevy SDK is not a workspace member; see `sdks/bevy/Cargo.toml`.
+    cmd!("cargo", "fmt", "--check").dir("sdks/bevy").run()?;
+    cmd!("cargo", "clippy", "--tests", "--", "-D", "warnings")
+        .dir("sdks/bevy")
+        .run()?;
     cmd!("dotnet", "tool", "restore").dir("crates/bindings-csharp").run()?;
     cmd!("dotnet", "csharpier", "--check", ".")
         .dir("crates/bindings-csharp")
