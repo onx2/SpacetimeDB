@@ -1,0 +1,6 @@
+[toolchain]
+# Newer than the repository's toolchain, because Bevy 0.20 declares `rust-version = "1.96.0"`.
+# This crate is excluded from the root workspace for exactly that reason; see its `Cargo.toml`.
+channel = "1.98.1"
+profile = "default"
+targets = ["wasm32-unknown-unknown"]

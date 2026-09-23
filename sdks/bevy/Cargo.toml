@@ -1,0 +1,93 @@
+# This crate is not a member of the repository's workspace: it is excluded from the root
+# `Cargo.toml`. Bevy declares a newer minimum Rust version than the repository's toolchain, so it
+# builds with its own toolchain (`rust-toolchain.toml` beside this file) and keeps its own lockfile.
+# It reaches the rest of the repository through path dependencies.
+[workspace]
+members = []
+
+[package]
+name = "spacetimedb-bevy"
+version = "2.11.0"
+edition = "2024"
+rust-version = "1.96.0"
+license-file = "LICENSE"
+description = "A Bevy-native SpacetimeDB client: the client cache lives in the Bevy World."
+repository = "https://github.com/clockworklabs/SpacetimeDB"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["tls"]
+# `wss://` and `https://` hosts. Does nothing in a browser, which needs no help with either.
+tls = ["dep:futures-rustls", "dep:webpki-roots"]
+
+[dependencies]
+spacetimedb-lib = { path = "../../crates/lib", default-features = false, features = ["serde"] }
+spacetimedb-sats = { path = "../../crates/sats" }
+spacetimedb-client-api-messages = { path = "../../crates/client-api-messages" }
+spacetimedb-query-builder = { path = "../../crates/query-builder" }
+
+bevy_app = "=0.20.0-rc.1"
+bevy_ecs = "=0.20.0-rc.1"
+bevy_state = "=0.20.0-rc.1"
+bevy_tasks = "=0.20.0-rc.1"
+bevy_platform = "=0.20.0-rc.1"
+bevy_reflect = "=0.20.0-rc.1"
+
+async-channel = "2"
+brotli = "3.5"
+bytes = "1"
+# `#[derive]` puts an `M: Clone`, `M: Debug`, `M: Hash` bound on every implementation it writes,
+# which the types that name a module cannot have: a module is a marker and is none of those
+# things. This reads the fields and writes the implementations without the bound.
+derive-where = "1.7"
+flate2 = "1"
+foldhash = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["io", "sink", "std"] }
+http = "1"
+log = "0.4"
+thiserror = "1"
+
+# The native transport: a TCP socket, TLS and the websocket protocol, all on the `smol` stack,
+# driven by the IO task pool's threads (hence `bevy_tasks`'s `async-io` feature).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy_tasks = { version = "=0.20.0-rc.1", features = ["async-io"] }
+async-io = "2"
+async-net = "2"
+async-tungstenite = "0.35"
+futures-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "1", optional = true }
+
+# On `wasm32` this crate means a browser: time and tasks come from it, and the transport is the
+# browser's own websocket, which does TLS itself.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy_platform = { version = "=0.20.0-rc.1", features = ["web"] }
+bevy_app = { version = "=0.20.0-rc.1", features = ["web"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "Headers",
+    "MessageEvent",
+    "Request",
+    "RequestInit",
+    "Response",
+    "WebSocket",
+    "Window",
+    "WorkerGlobalScope",
+] }
+
+[dev-dependencies]
+# Bevy's default features turn this on. Without it the task pool only advances when ticked.
+bevy_tasks = { version = "=0.20.0-rc.1", features = ["multi_threaded"] }
+futures-lite = "2"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"

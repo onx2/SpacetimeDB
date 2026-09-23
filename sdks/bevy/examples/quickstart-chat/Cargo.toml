@@ -1,0 +1,13 @@
+# A package of its own rather than a `[[example]]` of the SDK, so that `cargo test` in `sdks/bevy`
+# does not build the whole engine. Run it from this directory; see `src/main.rs`.
+[workspace]
+
+[package]
+name = "quickstart-chat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+spacetimedb-bevy = { path = "../.." }
+bevy = "=0.20.0-rc.1"

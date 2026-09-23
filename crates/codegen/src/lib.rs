@@ -2,6 +2,7 @@ use spacetimedb_lib::db::raw_def::v9::TableAccess;
 use spacetimedb_schema::def::{ModuleDef, ProcedureDef, ReducerDef, TableDef, TypeDef, ViewDef};
 use spacetimedb_schema::identifier::NamespacePath;
 use spacetimedb_schema::schema::{Schema, TableSchema};
+pub mod bevy;
 mod code_indenter;
 pub mod cpp;
 pub mod csharp;
@@ -10,6 +11,7 @@ pub mod typescript;
 pub mod unrealcpp;
 mod util;
 
+pub use self::bevy::Bevy;
 pub use self::csharp::Csharp;
 pub use self::rust::Rust;
 pub use self::typescript::TypeScript;
